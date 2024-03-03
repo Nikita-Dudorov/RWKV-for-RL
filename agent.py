@@ -1,9 +1,9 @@
-import torch
+from torch import nn
 from actor_critic import DiscreteActorCritic
 from rwkv import RwkvCell
 
-class RwkvAgent():
-
+class RwkvAgent(nn.Module):
+    
     def __init__(
             self,
             d_model,
@@ -11,13 +11,16 @@ class RwkvAgent():
             obs_dim,
             act_dim,
         ):
-        self.encoder = torch.nn.Linear(obs_dim, d_model)
+        super().__init__()
+
+        self.encoder = nn.Linear(obs_dim, d_model)
         self.seq_model = RwkvCell(d_model)
         self.ac = DiscreteActorCritic(
             n_hidden=d_ac, 
             obs_dim=d_model,
             act_dim=act_dim, 
         )
+        # TODO: init weights
         self.rec_state = None
 
     def reset_rec_state(self):
