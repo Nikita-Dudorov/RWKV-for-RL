@@ -1,77 +1,88 @@
+import os
 import random
 import torch
 import numpy as np
 import wandb
 import gymnasium as gym
+from collections import deque
 
 from create_env import create_env
 from config import TmazeArgs
-from agent import DiscreteActorCritic
-from rwkv import RwkvCell
+from agent import RwkvAgent
 
 
-def get_rollout(agent, env, init_obs, rollout_len, gamma, device, complete_episodes=False):
-    obs_dim = env.observation_space.shape[0]
-    observations = torch.zeros((rollout_len, obs_dim)).to(device)
-    action_probs = torch.zeros((rollout_len, 1)).to(device)
-    rewards = torch.zeros((rollout_len, 1)).to(device)
-    dones = torch.zeros((rollout_len, 1)).to(device)  # taking action at this step terminates the episode
-    rewards_to_go = torch.zeros((rollout_len, 1)).to(device)
-    values = torch.zeros((rollout_len, 1)).to(device)
-    advantages = torch.zeros((rollout_len, 1)).to(device)
-    time_intervals = []  # first and last steps of episodes within rollout
-    start = 0
+def get_rollout(
+        agent, 
+        env, 
+        init_obs, 
+        rollout_len, 
+        gamma, 
+        device,
+    ):
+    num_envs, obs_dim = env.observation_space.shape
+    observations = torch.zeros((num_envs, rollout_len, obs_dim)).to(device)
+    action_probs = torch.zeros((num_envs, rollout_len, 1)).to(device)
+    rewards = torch.zeros((num_envs, rollout_len, 1)).to(device)
+    rewards_to_go = torch.zeros((num_envs, rollout_len, 1)).to(device)
+    values = torch.zeros((num_envs, rollout_len, 1)).to(device)
+    advantages = torch.zeros((num_envs, rollout_len, 1)).to(device)
+    terminals = np.zeros((num_envs, rollout_len, 1), dtype=np.int32)  # taking action at this step terminates the episode
+    starts = np.zeros(num_envs, dtype=np.int32)
+    stops = np.zeros(num_envs, dtype=np.int32)
+    time_intervals = [[] for n in range(num_envs)]  # first and last steps of episodes within rollout
 
     # collect policy rollout
     with torch.no_grad():
 
         init_obs = torch.from_numpy(init_obs).float().to(device)
-        act, act_prob, act_entropy = agent.get_action(init_obs)
-        val = agent.get_value(init_obs)
-        observations[0] = init_obs
-        action_probs[0] = act_prob
-        values[0] = val
+        actor_out, critic_out = agent.get_action_and_value(init_obs)
+        act, act_prob, act_entropy = actor_out
+        val = critic_out
+        observations[:, 0] = init_obs
+        action_probs[:, 0] = act_prob
+        values[:, 0] = val
 
         for t in range(1, rollout_len):
-            obs, rwd, done, truncated, info = env.step(act.item())
+            obs, rwd, done, truncated, info = env.step(act.numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
             terminated = done or truncated
-            rewards[t-1] = rwd
-            dones[t-1] = terminated
-            if terminated:
-                finish = t-1
-                time_intervals.append((start, finish))
-                start = t
-                obs, info = env.reset()
+            rewards[:, t-1] = torch.from_numpy(rwd)
+            terminals[:, t-1] = terminated
+            for n, term in enumerate(terminated):
+                if term:
+                    stops[n] = t-1
+                    time_intervals[n].append((starts[n], stops[n]))
+                    starts[n] = t
             obs = torch.from_numpy(obs).float().to(device)
-            act, act_prob, act_entropy = agent.get_action(obs)
-            val = agent.get_value(obs)
-            observations[t] = obs
-            action_probs[t] = act_prob 
-            values[t] = val
+            actor_out, critic_out = agent.get_action_and_value(obs)
+            act, act_prob, act_entropy = actor_out
+            val = critic_out
+            observations[:, t] = obs
+            action_probs[:, t] = act_prob 
+            values[:, t] = val
 
         t = rollout_len - 1
-        last_obs, rwd, done, truncated, info = env.step(act.item())
+        last_obs, rwd, done, truncated, info = env.step(act.numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
         last_val = agent.get_value(torch.from_numpy(last_obs).float().to(device))
         terminated = done or truncated
-        rewards[t] = rwd
-        dones[t] = terminated
-        finish = t
-        time_intervals.append((start, finish))
-        start = rollout_len
-        if terminated:
-            last_obs, info = env.reset()
+        rewards[:, t] = torch.from_numpy(rwd)
+        terminals[:, t] = terminated
+        stops[:] = t
+        for n in range(num_envs):
+            time_intervals[n].append((starts[n], stops[n]))
+        starts[:] = rollout_len
 
         # calculate rewards-to-go
-        for interval in time_intervals:
-            start, finish = interval
-            for t in reversed(range(start, finish+1)):
-                if dones[t]:
-                    rewards_to_go[t] = rewards[t]
-                else:
-                    if t + 1 <= rollout_len - 1:
-                        rewards_to_go[t] = rewards[t] + gamma * rewards_to_go[t+1]
+        for n in range(num_envs):
+            for interval in time_intervals[n]:
+                start, stop = interval
+                for t in reversed(range(start, stop+1)):
+                    if terminals[n, t]:
+                        rewards_to_go[n, t] = rewards[n, t]
                     else:
-                        rewards_to_go[t] = rewards[t] + gamma * last_val
+                        if t + 1 <= rollout_len - 1:
+                            rewards_to_go[n, t] = rewards[n, t] + gamma * rewards_to_go[n, t+1]
+                        else:
+                            rewards_to_go[n, t] = rewards[n, t] + gamma * last_val[n]
         # rewards_to_go = (rewards_to_go - rewards_to_go.mean()) / (rewards_to_go.std() + 1e-8)  # TODO normalize rewards-to-go?
         
         # calculate advantages
@@ -79,13 +90,14 @@ def get_rollout(agent, env, init_obs, rollout_len, gamma, device, complete_episo
         # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # TODO normalize advantages?
         # TODO gae + lambda
 
-        if complete_episodes: 
-            final_step = torch.where(dones == 1)[0].max().item()
-            last_obs, info = env.reset()
-        else:
-            final_step = rollout_len - 1
-
-    return observations[:final_step+1], action_probs[:final_step+1], rewards_to_go[:final_step+1], values[:final_step+1], advantages[:final_step+1], last_obs 
+    rollout = {
+        'observations': observations,
+        'action_probs': action_probs,
+        'rewards_to_go': rewards_to_go,
+        'values': values,
+        'advantages': advantages,
+    }
+    return rollout, last_obs
 
 
 def eval(agent, env, n_eval_episodes, device):
@@ -104,14 +116,20 @@ def eval(agent, env, n_eval_episodes, device):
     return scores
             
 
-if __name__ == "__main__":
+def train():
     args = TmazeArgs()
     ppo_eps = args.ppo_eps
     c_val_loss = args.c_val_loss
     c_entr_loss = args.c_entr_loss
     n_env_steps = args.n_env_steps
+    n_envs = args.n_envs
     rollout_len = args.rollout_len
-    batch_size = args.batch_size
+    minibatch = args.minibatch
+    batch_size = n_envs * rollout_len
+    n_iters = int(n_env_steps / batch_size)
+    log_every = int(args.log_every / batch_size)
+    eval_every = int(args.eval_every / batch_size)
+    save_every = None if args.save_every is None else int(args.save_every / batch_size)
     device = args.device
 
     # setup wandb
@@ -130,47 +148,59 @@ if __name__ == "__main__":
     wandb.define_metric("eval/return_std", step_metric="env_steps_trained")
 
     # setup env
-    # TODO: vec env
-    env = create_env(args.env_id, args.env_config)
-    env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=args.n_eval_episodes)
-    # env = gym.wrappers.NormalizeObservation(env)
-    # env = gym.wrappers.NormalizeReward(env)
-    eval_env = gym.make(args.env_id, args.env_config)
-    eval_env = gym.wrappers.RecordEpisodeStatistics(eval_env, deque_size=args.n_eval_episodes)
-    if args.videos:
-        eval_env = gym.wrappers.RecordVideo(eval_env, video_folder='videos', episode_trigger=lambda k: k % args.n_eval_episodes == 0)
-    # eval_env = gym.wrappers.NormalizeObservation(eval_env)
-    # env = gym.wrappers.NormalizeReward(env)
+    def wrap_env(env):
+        env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=args.n_eval_episodes)
+        # env = gym.wrappers.NormalizeObservation(env)
+        # env = gym.wrappers.NormalizeReward(env)
+        return env
+    def wrap_eval_env(env):
+        env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=args.n_eval_episodes)
+        # env = gym.wrappers.NormalizeObservation(env)
+        # env = gym.wrappers.NormalizeReward(env)
+        if args.videos:
+            env = gym.wrappers.RecordVideo(env, video_folder='videos', episode_trigger=lambda k: k % args.n_eval_episodes == 0)
+        return env
+    env = wrap_env(gym.vector.AsyncVectorEnv([lambda: create_env(args.env_id, **args.env_config) for n in range(n_envs)]))
+    eval_env = wrap_eval_env(create_env(args.env_id, **args.env_config))
 
     # set seed for reproducibility
     seed = args.seed
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    # env.seed(seed)
-    # eval_env.seed(seed)
+    init_obs, info = env.reset(seed=[random.randint(1, 999) for n in range(n_envs)])
 
-    # define agent and optimizer
-    agent = DiscreteActorCritic(
-        n_hidden=args.n_hidden, 
-        obs_dim=env.observation_space.shape[0],
-        act_dim=env.action_space.n, 
+    # define agent
+    _, obs_dim = env.observation_space.shape
+    act_dim = env.action_space[0].n
+    agent = RwkvAgent(
+        d_model=args.d_model,
+        d_ac=args.d_ac,
+        obs_dim=obs_dim,
+        act_dim=act_dim,
     ).to(device)
+    agent.reset_rec_state() # TODO: agent should have a separate recurrent state for each env and reset it as env resets
+
+    # define optimizer
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
 
     # training loop
-    n_iters = int(n_env_steps / rollout_len)
-    init_obs, info = env.reset()
+    run_loss = deque(maxlen=50)
     for iter in range(1, n_iters+1):
 
-        *rollout, init_obs = get_rollout(agent, env, init_obs, rollout_len, args.gamma, device)
-        observations, action_probs, rewards_to_go, values, advantages = rollout
+        rollout, init_obs = get_rollout(agent, env, init_obs, rollout_len, args.gamma, device)
+        observations = rollout['observations'].view(-1, obs_dim)
+        action_probs = rollout['action_probs'].view(-1, 1)
+        rewards_to_go = rollout['rewards_to_go'].view(-1, 1) 
+        # values = rollout['valaues'].view(-1, 1)
+        advantages = rollout['advantages'].view(-1, 1)
+        assert len(observations) == batch_size
 
         for epoch in range(args.n_epochs):
-            inds = torch.arange(0, len(observations))
+            inds = torch.arange(0, batch_size)
             inds = inds[torch.randperm(len(inds))]
-            for step in range(len(observations) // batch_size):
-                b_inds = inds[step*batch_size:(step+1)*batch_size]
+            for step in range(batch_size // minibatch):
+                b_inds = inds[step*minibatch:(step+1)*minibatch]
                 b_obs = observations[b_inds]
                 b_act_prob = action_probs[b_inds].view(-1)
                 b_rwd_to_go = rewards_to_go[b_inds].view(-1)
@@ -181,10 +211,11 @@ if __name__ == "__main__":
                 # b_rwd_to_go = (b_rwd_to_go - b_rwd_to_go.mean()) / (b_rwd_to_go.std() + 1e-8)
                 # b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
-                b_pred_val = agent.get_value(b_obs).view(-1)
-                # b_pred_val = b_val + (b_pred_val - b_val).clip(-ppo_eps, ppo_eps)  # TODO: clip values?
-                b_pred_act, b_pred_act_prob, b_pred_act_entropy = agent.get_action(b_obs)
+                actor_out, critic_out = agent.get_action_and_value(b_obs)
+                b_pred_act, b_pred_act_prob, b_pred_act_entropy = actor_out
                 # b_prob_ratio = b_pred_act_prob / b_act_prob
+                b_pred_val = critic_out.view(-1)
+                # b_pred_val = b_val + (b_pred_val - b_val).clip(-ppo_eps, ppo_eps)  # TODO: clip values?
 
                 actor_loss = -(b_pred_act_prob * b_adv).mean()
                 # actor_loss = -torch.min(b_prob_ratio * b_adv, b_prob_ratio.clamp(1-ppo_eps, 1+ppo_eps) * b_adv).mean()  # PPO loss
@@ -196,19 +227,22 @@ if __name__ == "__main__":
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
+                run_loss.append(loss.item())
 
-        env_steps_trained = iter * rollout_len
-        # TODO: running average for loss
-        if iter % args.log_every == 0:
+        env_steps_trained = iter * batch_size
+        
+        if iter % log_every == 0:
+            # TODO: running average for all losses
             ep_score_mean = sum(env.return_queue)/(max(len(env.return_queue), 1))
             ep_len_mean = sum(env.length_queue)/(max(len(env.length_queue), 1))
+            run_loss_mean = sum(run_loss)/(max(len(run_loss), 1))
             print(f"| iter: {iter} | env steps trained: {env_steps_trained} |")
-            print(f"| loss: {loss.item()} | ppo loss: {actor_loss.item()} | value loss: {value_loss.item()} | entropy loss: {entropy_loss.item()} |")
+            print(f"| loss: {loss.item()} | actor loss: {actor_loss.item()} | critic loss: {value_loss.item()} | entropy loss: {entropy_loss.item()} |")
             print(f"| train/return_mean: {ep_score_mean} | train/ep_len_mean: {ep_len_mean} |")
             print(f"| lr: {optimizer.param_groups[0]['lr']} | ppo_eps: {ppo_eps}")
             print()
-            wandb.log({'train/loss': loss.item(), 'train/return_mean': ep_score_mean, 'env_steps_trained': env_steps_trained})
-        if iter % args.eval_every == 0:
+            wandb.log({'train/loss': run_loss_mean, 'train/return_mean': ep_score_mean, 'env_steps_trained': env_steps_trained})
+        if iter % eval_every == 0:
             ep_scores = eval(agent, eval_env, args.n_eval_episodes, device)
             ep_score_mean = ep_scores.mean().item()
             ep_score_std = ep_scores.std().item()
@@ -216,8 +250,8 @@ if __name__ == "__main__":
             print(f"| eval/return_mean: {ep_score_mean} | eval/return_std: {ep_score_std} |")
             print()
             wandb.log({'eval/return_mean': ep_score_mean, 'eval/return_std': ep_score_std, 'env_steps_trained': env_steps_trained})
-        if (args.save_every is not None) and (iter % args.save_every == 0):
-            torch.save(agent.state_dict(), args.save_path + '_' + str(iter))
+        if (save_every is not None) and (iter % save_every == 0):
+            torch.save(agent.state_dict(), os.path.join(args.save_path, str(iter)))
 
         if args.lr_decay:
             optimizer.param_groups[0]['lr'] = args.lr * (1 - iter / n_iters)
@@ -227,16 +261,6 @@ if __name__ == "__main__":
     env.close()
     eval_env.close()
 
-def train():
-    state_dim = 10
-    d_model = 128
-    encoder = torch.nn.Linear(state_dim, d_model)
-    model =  RwkvCell(d_model)
-    h = model.get_initial_state()
-    state = torch.rand(state_dim)
-    x = encoder(state)
-    x, h = model(x, h)
-    print(x.shape, h.shape)
 
 if __name__ == "__main__":
     train()
