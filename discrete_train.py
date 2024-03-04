@@ -11,8 +11,10 @@ from config import TmazeArgs
 from agent import RwkvAgent
 
 
+@torch.no_grad()
 def get_rollout(
         agent, 
+        recurrent_state,
         env, 
         init_obs, 
         rollout_len, 
@@ -27,68 +29,48 @@ def get_rollout(
     values = torch.zeros((num_envs, rollout_len, 1)).to(device)
     advantages = torch.zeros((num_envs, rollout_len, 1)).to(device)
     terminals = np.zeros((num_envs, rollout_len, 1), dtype=np.int32)  # taking action at this step terminates the episode
-    starts = np.zeros(num_envs, dtype=np.int32)
-    stops = np.zeros(num_envs, dtype=np.int32)
-    time_intervals = [[] for n in range(num_envs)]  # first and last steps of episodes within rollout
 
     # collect policy rollout
-    with torch.no_grad():
-
-        init_obs = torch.from_numpy(init_obs).float().to(device)
-        actor_out, critic_out = agent.get_action_and_value(init_obs)
+    obs = init_obs
+    for t in range(0, rollout_len):
+        obs = torch.from_numpy(obs).float().to(device)
+        actor_out, critic_out, recurrent_state = agent.get_action_and_value(obs, recurrent_state)
         act, act_prob, act_entropy = actor_out
         val = critic_out
-        observations[:, 0] = init_obs
-        action_probs[:, 0] = act_prob
-        values[:, 0] = val
+        observations[:, t] = obs
+        action_probs[:, t] = act_prob 
+        values[:, t] = val
 
-        for t in range(1, rollout_len):
-            obs, rwd, done, truncated, info = env.step(act.numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
-            terminated = done or truncated
-            rewards[:, t-1] = torch.from_numpy(rwd)
-            terminals[:, t-1] = terminated
-            for n, term in enumerate(terminated):
-                if term:
-                    stops[n] = t-1
-                    time_intervals[n].append((starts[n], stops[n]))
-                    starts[n] = t
-            obs = torch.from_numpy(obs).float().to(device)
-            actor_out, critic_out = agent.get_action_and_value(obs)
-            act, act_prob, act_entropy = actor_out
-            val = critic_out
-            observations[:, t] = obs
-            action_probs[:, t] = act_prob 
-            values[:, t] = val
-
-        t = rollout_len - 1
-        last_obs, rwd, done, truncated, info = env.step(act.numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
-        last_val = agent.get_value(torch.from_numpy(last_obs).float().to(device))
+        obs, rwd, done, truncated, info = env.step(act.numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
         terminated = done or truncated
+        for n, term in enumerate(terminated):
+            if term: recurrent_state[n] = agent.reset_rec_state()
         rewards[:, t] = torch.from_numpy(rwd)
         terminals[:, t] = terminated
-        stops[:] = t
-        for n in range(num_envs):
-            time_intervals[n].append((starts[n], stops[n]))
-        starts[:] = rollout_len
+    last_obs = obs
+    last_val = val
 
-        # calculate rewards-to-go
-        for n in range(num_envs):
-            for interval in time_intervals[n]:
-                start, stop = interval
-                for t in reversed(range(start, stop+1)):
-                    if terminals[n, t]:
-                        rewards_to_go[n, t] = rewards[n, t]
+    # calculate rewards-to-go
+    for n in range(num_envs):
+        episode_intervals = [-1] + list(np.where(terminals[n] == 1)[0])
+        if episode_intervals[-1] != rollout_len-1: episode_intervals = episode_intervals + [rollout_len-1]
+        episode_intervals = [(start+1, stop) for start, stop in zip(episode_intervals[:-1], episode_intervals[1:])]
+        for interval in episode_intervals:
+            start, stop = interval
+            for t in reversed(range(start, stop+1)):
+                if terminals[n, t]: 
+                    rewards_to_go[n, t] = rewards[n, t]
+                else:
+                    if t <= rollout_len - 2:
+                        rewards_to_go[n, t] = rewards[n, t] + gamma * rewards_to_go[n, t+1]
                     else:
-                        if t + 1 <= rollout_len - 1:
-                            rewards_to_go[n, t] = rewards[n, t] + gamma * rewards_to_go[n, t+1]
-                        else:
-                            rewards_to_go[n, t] = rewards[n, t] + gamma * last_val[n]
-        # rewards_to_go = (rewards_to_go - rewards_to_go.mean()) / (rewards_to_go.std() + 1e-8)  # TODO normalize rewards-to-go?
-        
-        # calculate advantages
-        advantages = rewards_to_go - values
-        # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # TODO normalize advantages?
-        # TODO gae + lambda
+                        rewards_to_go[n, t] = last_val[n]
+    # rewards_to_go = (rewards_to_go - rewards_to_go.mean()) / (rewards_to_go.std() + 1e-8)  # TODO normalize rewards-to-go?
+    
+    # calculate advantages
+    advantages = rewards_to_go - values
+    # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # TODO normalize advantages?
+    # TODO gae + lambda
 
     rollout = {
         'observations': observations,
@@ -97,22 +79,24 @@ def get_rollout(
         'values': values,
         'advantages': advantages,
     }
-    return rollout, last_obs
+    return rollout, last_obs, recurrent_state
 
 
+@torch.no_grad()
 def eval(agent, env, n_eval_episodes, device):
-    with torch.no_grad():
-        scores = torch.zeros(n_eval_episodes)
-        for ep in range(n_eval_episodes):
-            obs, info = env.reset()
-            terminated = False
-            ep_ret = 0
-            while not terminated:
-                act, *_ = agent.get_action(torch.from_numpy(obs).float().to(device))
-                obs, rwd, done, truncated, info = env.step(act.item())
-                terminated = done or truncated
-                ep_ret += rwd
-            scores[ep] = ep_ret
+    scores = torch.zeros(n_eval_episodes)
+    for ep in range(n_eval_episodes):
+        recurrent_state = agent.reset_rec_state()
+        obs, info = env.reset()
+        terminated = False
+        ep_ret = 0
+        while not terminated:
+            actor_out, recurrent_state = agent.get_action(torch.from_numpy(obs).float().to(device), recurrent_state)
+            act, *_ = actor_out
+            obs, rwd, done, truncated, info = env.step(act.item())
+            terminated = done or truncated
+            ep_ret += rwd
+        scores[ep] = ep_ret
     return scores
             
 
@@ -179,7 +163,8 @@ def train():
         obs_dim=obs_dim,
         act_dim=act_dim,
     ).to(device)
-    agent.reset_rec_state() # TODO: agent should have a separate recurrent state for each env and reset it as env resets
+    # agent should have a separate recurrent state for each env and reset it as env resets
+    recurrent_states = [agent.reset_rec_state() for n in range(n_envs)]
 
     # define optimizer
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
@@ -188,7 +173,7 @@ def train():
     run_loss = deque(maxlen=50)
     for iter in range(1, n_iters+1):
 
-        rollout, init_obs = get_rollout(agent, env, init_obs, rollout_len, args.gamma, device)
+        rollout, init_obs, recurrent_states = get_rollout(agent, recurrent_states, env, init_obs, rollout_len, args.gamma, device)
         observations = rollout['observations'].view(-1, obs_dim)
         action_probs = rollout['action_probs'].view(-1, 1)
         rewards_to_go = rollout['rewards_to_go'].view(-1, 1) 
@@ -199,7 +184,7 @@ def train():
         for epoch in range(args.n_epochs):
             inds = torch.arange(0, batch_size)
             inds = inds[torch.randperm(len(inds))]
-            for step in range(batch_size // minibatch):
+            for step in range(int(batch_size / minibatch)):
                 b_inds = inds[step*minibatch:(step+1)*minibatch]
                 b_obs = observations[b_inds]
                 b_act_prob = action_probs[b_inds].view(-1)
@@ -211,7 +196,9 @@ def train():
                 # b_rwd_to_go = (b_rwd_to_go - b_rwd_to_go.mean()) / (b_rwd_to_go.std() + 1e-8)
                 # b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
-                actor_out, critic_out = agent.get_action_and_value(b_obs)
+                # TODO: which recurrent state to use here??
+                wrong_recurrent_state = agent.reset_rec_state()
+                actor_out, critic_out, wrong_recurrent_state = agent.get_action_and_value(b_obs, wrong_recurrent_state)
                 b_pred_act, b_pred_act_prob, b_pred_act_entropy = actor_out
                 # b_prob_ratio = b_pred_act_prob / b_act_prob
                 b_pred_val = critic_out.view(-1)
