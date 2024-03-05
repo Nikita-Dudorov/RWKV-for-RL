@@ -14,7 +14,7 @@ from agent import RwkvAgent
 @torch.no_grad()
 def get_rollout(
         agent, 
-        recurrent_state,
+        agent_state,
         env, 
         init_obs, 
         rollout_len, 
@@ -29,22 +29,26 @@ def get_rollout(
     values = torch.zeros((num_envs, rollout_len, 1)).to(device)
     advantages = torch.zeros((num_envs, rollout_len, 1)).to(device)
     terminals = np.zeros((num_envs, rollout_len, 1), dtype=np.int32)  # taking action at this step terminates the episode
+    assert agent_state.shape[0] == num_envs, "agent should have a separate recurrent state for each env"
+    rollout_agent_states = torch.zeros((num_envs, rollout_len, *tuple(agent_state.shape[1:]))).to(device)
 
     # collect policy rollout
     obs = init_obs
     for t in range(0, rollout_len):
         obs = torch.from_numpy(obs).float().to(device)
-        actor_out, critic_out, recurrent_state = agent.get_action_and_value(obs, recurrent_state)
+        actor_out, critic_out, new_agent_state = agent.get_action_and_value(obs, agent_state)
         act, act_prob, act_entropy = actor_out
         val = critic_out
         observations[:, t] = obs
         action_probs[:, t] = act_prob 
         values[:, t] = val
+        rollout_agent_states[:, t] = agent_state
+        agent_state = new_agent_state
 
-        obs, rwd, done, truncated, info = env.step(act.numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
+        obs, rwd, done, truncated, info = env.step(act.cpu().numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
         terminated = done or truncated
         for n, term in enumerate(terminated):
-            if term: recurrent_state[n] = agent.reset_rec_state()
+            if term: agent_state[n] = agent.reset_rec_state()
         rewards[:, t] = torch.from_numpy(rwd)
         terminals[:, t] = terminated
     last_obs = obs
@@ -78,20 +82,21 @@ def get_rollout(
         'rewards_to_go': rewards_to_go,
         'values': values,
         'advantages': advantages,
+        'rollout_agent_states': rollout_agent_states,
     }
-    return rollout, last_obs, recurrent_state
+    return rollout, last_obs, agent_state
 
 
 @torch.no_grad()
 def eval(agent, env, n_eval_episodes, device):
     scores = torch.zeros(n_eval_episodes)
     for ep in range(n_eval_episodes):
-        recurrent_state = agent.reset_rec_state()
+        agent_state = agent.reset_rec_state()
         obs, info = env.reset()
         terminated = False
         ep_ret = 0
         while not terminated:
-            actor_out, recurrent_state = agent.get_action(torch.from_numpy(obs).float().to(device), recurrent_state)
+            actor_out, agent_state = agent.get_action(torch.from_numpy(obs).float().to(device), agent_state)
             act, *_ = actor_out
             obs, rwd, done, truncated, info = env.step(act.item())
             terminated = done or truncated
@@ -164,7 +169,8 @@ def train():
         act_dim=act_dim,
     ).to(device)
     # agent should have a separate recurrent state for each env and reset it as env resets
-    recurrent_states = [agent.reset_rec_state() for n in range(n_envs)]
+    agent_states = torch.from_numpy(np.array([agent.reset_rec_state() for n in range(n_envs)])).to(device)
+    agent_state_shape = tuple(agent_states.shape[1:])
 
     # define optimizer
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
@@ -173,12 +179,13 @@ def train():
     run_loss = deque(maxlen=50)
     for iter in range(1, n_iters+1):
 
-        rollout, init_obs, recurrent_states = get_rollout(agent, recurrent_states, env, init_obs, rollout_len, args.gamma, device)
+        rollout, init_obs, agent_states = get_rollout(agent, agent_states, env, init_obs, rollout_len, args.gamma, device)
         observations = rollout['observations'].view(-1, obs_dim)
         action_probs = rollout['action_probs'].view(-1, 1)
         rewards_to_go = rollout['rewards_to_go'].view(-1, 1) 
         # values = rollout['valaues'].view(-1, 1)
         advantages = rollout['advantages'].view(-1, 1)
+        rollout_agent_states = rollout['rollout_agent_states'].view(-1, *agent_state_shape)
         assert len(observations) == batch_size
 
         for epoch in range(args.n_epochs):
@@ -191,14 +198,13 @@ def train():
                 b_rwd_to_go = rewards_to_go[b_inds].view(-1)
                 # b_val = values[b_inds].view(-1)
                 b_adv = advantages[b_inds].view(-1)
+                b_rollout_agent_st = rollout_agent_states[b_inds]
                 
                 # TODO: normalize batch?
                 # b_rwd_to_go = (b_rwd_to_go - b_rwd_to_go.mean()) / (b_rwd_to_go.std() + 1e-8)
                 # b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
-                # TODO: which recurrent state to use here??
-                wrong_recurrent_state = agent.reset_rec_state()
-                actor_out, critic_out, wrong_recurrent_state = agent.get_action_and_value(b_obs, wrong_recurrent_state)
+                actor_out, critic_out, b_pred_agent_st = agent.get_action_and_value(b_obs, b_rollout_agent_st)
                 b_pred_act, b_pred_act_prob, b_pred_act_entropy = actor_out
                 # b_prob_ratio = b_pred_act_prob / b_act_prob
                 b_pred_val = critic_out.view(-1)
