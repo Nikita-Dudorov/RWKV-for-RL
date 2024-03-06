@@ -11,7 +11,7 @@ class RwkvAgent(nn.Module):
             act_dim,
         ):
         super().__init__()
-        self.encoder = nn.Linear(obs_dim, d_model)
+        self.encoder = nn.Linear(obs_dim, d_model)  # supports only row observation
         self.seq_model = RwkvCell(d_model)
         self.ac = DiscreteActorCritic(
             n_hidden=d_ac, 
