@@ -21,8 +21,9 @@ def get_rollout(
         gamma, 
         device,
     ):
-    num_envs, obs_dim = env.observation_space.shape
-    observations = torch.zeros((num_envs, rollout_len, obs_dim)).to(device)
+    num_envs = env.observation_space.shape[0]
+    obs_shape = env.observation_space.shape[1:]
+    observations = torch.zeros((num_envs, rollout_len, *obs_shape)).to(device)
     action_probs = torch.zeros((num_envs, rollout_len, 1)).to(device)
     rewards = torch.zeros((num_envs, rollout_len, 1)).to(device)
     rewards_to_go = torch.zeros((num_envs, rollout_len, 1)).to(device)
@@ -91,12 +92,12 @@ def get_rollout(
 def eval(agent, env, n_eval_episodes, device):
     scores = torch.zeros(n_eval_episodes)
     for ep in range(n_eval_episodes):
-        agent_state = agent.reset_rec_state()
+        agent_state = agent.reset_rec_state().unsqueeze(0).to(device)  # add batch dim
         obs, info = env.reset()
         terminated = False
         ep_ret = 0
         while not terminated:
-            actor_out, agent_state = agent.get_action(torch.from_numpy(obs).float().to(device), agent_state)
+            actor_out, agent_state = agent.get_action(torch.from_numpy(obs).float().unsqueeze(0).to(device), agent_state)
             act, *_ = actor_out
             obs, rwd, done, truncated, info = env.step(act.item())
             terminated = done or truncated
@@ -131,10 +132,8 @@ def train():
     # define our custom x axis metric
     wandb.define_metric("env_steps_trained")
     # define which metrics will be plotted against it
-    wandb.define_metric("train/loss", step_metric="env_steps_trained")
-    wandb.define_metric("train/return_mean", step_metric="env_steps_trained")
-    wandb.define_metric("eval/return_mean", step_metric="env_steps_trained")
-    wandb.define_metric("eval/return_std", step_metric="env_steps_trained")
+    wandb.define_metric("train/*", step_metric="env_steps_trained")
+    wandb.define_metric("eval/*", step_metric="env_steps_trained")
 
     # setup env
     def wrap_env(env):
@@ -160,27 +159,31 @@ def train():
     init_obs, info = env.reset(seed=[random.randint(1, 999) for n in range(n_envs)])
 
     # define agent
-    _, obs_dim = env.observation_space.shape
+    obs_shape = env.observation_space.shape[1:]
     act_dim = env.action_space[0].n
     agent = RwkvAgent(
         d_model=args.d_model,
         d_ac=args.d_ac,
-        obs_dim=obs_dim,
+        obs_dim=obs_shape[0],  # supports only row observation
         act_dim=act_dim,
     ).to(device)
     # agent should have a separate recurrent state for each env and reset it as env resets
-    agent_states = torch.from_numpy(np.array([agent.reset_rec_state() for n in range(n_envs)])).to(device)
+    agent_states = torch.stack([agent.reset_rec_state() for n in range(n_envs)]).to(device)
     agent_state_shape = tuple(agent_states.shape[1:])
 
     # define optimizer
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
 
     # training loop
-    run_loss = deque(maxlen=50)
+    run_window = 50
+    run_loss = deque(maxlen=run_window)
+    run_actor_loss = deque(maxlen=run_window)
+    run_critic_loss = deque(maxlen=run_window)
+    run_entropy_loss = deque(maxlen=run_window)
     for iter in range(1, n_iters+1):
 
         rollout, init_obs, agent_states = get_rollout(agent, agent_states, env, init_obs, rollout_len, args.gamma, device)
-        observations = rollout['observations'].view(-1, obs_dim)
+        observations = rollout['observations'].view(-1, *obs_shape)
         action_probs = rollout['action_probs'].view(-1, 1)
         rewards_to_go = rollout['rewards_to_go'].view(-1, 1) 
         # values = rollout['valaues'].view(-1, 1)
@@ -212,37 +215,59 @@ def train():
 
                 actor_loss = -(b_pred_act_prob * b_adv).mean()
                 # actor_loss = -torch.min(b_prob_ratio * b_adv, b_prob_ratio.clamp(1-ppo_eps, 1+ppo_eps) * b_adv).mean()  # PPO loss
-                value_loss = ((b_pred_val - b_rwd_to_go)**2).mean()
+                critic_loss = ((b_pred_val - b_rwd_to_go)**2).mean()
                 entropy_loss = -b_pred_act_entropy.mean()
 
-                loss = actor_loss + c_val_loss * value_loss + c_entr_loss * entropy_loss
+                loss = actor_loss + c_val_loss * critic_loss + c_entr_loss * entropy_loss
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
+
                 run_loss.append(loss.item())
+                run_actor_loss.append(actor_loss.item())
+                run_critic_loss.append(critic_loss.item())
+                run_entropy_loss.append(entropy_loss.item())
 
         env_steps_trained = iter * batch_size
         
         if iter % log_every == 0:
             # TODO: running average for all losses
-            ep_score_mean = sum(env.return_queue)/(max(len(env.return_queue), 1))
-            ep_len_mean = sum(env.length_queue)/(max(len(env.length_queue), 1))
-            run_loss_mean = sum(run_loss)/(max(len(run_loss), 1))
+            episode_score_mean = sum(env.return_queue)/(max(len(env.return_queue), 1))
+            episode_len_mean = sum(env.length_queue)/(max(len(env.length_queue), 1))
+            loss_mean = sum(run_loss)/len(run_loss)
+            actor_loss_mean = sum(run_actor_loss)/len(run_actor_loss)
+            critic_loss_mean = sum(run_critic_loss)/len(run_critic_loss)
+            entropy_loss_mean = sum(run_entropy_loss)/len(run_entropy_loss)
             print(f"| iter: {iter} | env steps trained: {env_steps_trained} |")
-            print(f"| loss: {loss.item()} | actor loss: {actor_loss.item()} | critic loss: {value_loss.item()} | entropy loss: {entropy_loss.item()} |")
-            print(f"| train/return_mean: {ep_score_mean} | train/ep_len_mean: {ep_len_mean} |")
+            print(f"| loss: {loss_mean} | actor loss: {actor_loss_mean} | critic loss: {critic_loss_mean} | entropy loss: {entropy_loss_mean} |")
+            print(f"| train/episode_score_mean: {episode_score_mean} | train/episode_len_mean: {episode_len_mean} |")
             print(f"| lr: {optimizer.param_groups[0]['lr']} | ppo_eps: {ppo_eps}")
-            print()
-            wandb.log({'train/loss': run_loss_mean, 'train/return_mean': ep_score_mean, 'env_steps_trained': env_steps_trained})
+            print("==================")
+            wandb.log({
+                'train/loss': loss_mean, 
+                'train/actor_loss': actor_loss_mean,
+                'train/critic_loss': critic_loss_mean,
+                'train/entropy_loss': entropy_loss_mean,
+                'train/episode_len_mean': episode_len_mean,
+                'train/episode_score_mean': episode_score_mean,
+                'train/lr': optimizer.param_groups[0]['lr'],
+                'train/clip_eps': ppo_eps, 
+                'env_steps_trained': env_steps_trained,
+            })
         if iter % eval_every == 0:
-            ep_scores = eval(agent, eval_env, args.n_eval_episodes, device)
-            ep_score_mean = ep_scores.mean().item()
-            ep_score_std = ep_scores.std().item()
+            episode_scores = eval(agent, eval_env, args.n_eval_episodes, device)
+            episode_score_mean = episode_scores.mean().item()
+            episode_score_std = episode_scores.std().item()
             print(f"| iter: {iter} | env steps trained: {env_steps_trained} |")
-            print(f"| eval/return_mean: {ep_score_mean} | eval/return_std: {ep_score_std} |")
-            print()
-            wandb.log({'eval/return_mean': ep_score_mean, 'eval/return_std': ep_score_std, 'env_steps_trained': env_steps_trained})
+            print(f"| eval/episode_score_mean: {episode_score_mean} | eval/episode_score_std: {episode_score_std} |")
+            print("==================")
+            wandb.log({
+                'eval/episode_len_mean': episode_len_mean,
+                'eval/episode_score_mean': episode_score_mean, 
+                'eval/episode_score_std': episode_score_std, 
+                'env_steps_trained': env_steps_trained
+            })
         if (save_every is not None) and (iter % save_every == 0):
             torch.save(agent.state_dict(), os.path.join(args.save_path, str(iter)))
 
