@@ -24,12 +24,12 @@ def get_rollout(
     num_envs = env.observation_space.shape[0]
     obs_shape = env.observation_space.shape[1:]
     observations = torch.zeros((num_envs, rollout_len, *obs_shape)).to(device)
-    action_probs = torch.zeros((num_envs, rollout_len, 1)).to(device)
-    rewards = torch.zeros((num_envs, rollout_len, 1)).to(device)
-    rewards_to_go = torch.zeros((num_envs, rollout_len, 1)).to(device)
-    values = torch.zeros((num_envs, rollout_len, 1)).to(device)
-    advantages = torch.zeros((num_envs, rollout_len, 1)).to(device)
-    terminals = np.zeros((num_envs, rollout_len, 1), dtype=np.int32)  # taking action at this step terminates the episode
+    action_probs = torch.zeros((num_envs, rollout_len)).to(device)
+    rewards = torch.zeros((num_envs, rollout_len)).to(device)
+    rewards_to_go = torch.zeros((num_envs, rollout_len)).to(device)
+    values = torch.zeros((num_envs, rollout_len)).to(device)
+    advantages = torch.zeros((num_envs, rollout_len)).to(device)
+    terminals = np.zeros((num_envs, rollout_len), dtype=np.int32)  # taking action at this step terminates the episode
     assert agent_state.shape[0] == num_envs, "agent should have a separate recurrent state for each env"
     rollout_agent_states = torch.zeros((num_envs, rollout_len, *tuple(agent_state.shape[1:]))).to(device)
 
@@ -39,7 +39,7 @@ def get_rollout(
         obs = torch.from_numpy(obs).float().to(device)
         actor_out, critic_out, new_agent_state = agent.get_action_and_value(obs, agent_state)
         act, act_prob, act_entropy = actor_out
-        val = critic_out
+        val = critic_out.squeeze()
         observations[:, t] = obs
         action_probs[:, t] = act_prob 
         values[:, t] = val
@@ -47,7 +47,7 @@ def get_rollout(
         agent_state = new_agent_state
 
         obs, rwd, done, truncated, info = env.step(act.cpu().numpy())  # when using autoreset wrapper, when episode is terminated, obs is a new obs
-        terminated = done or truncated
+        terminated = done | truncated
         for n, term in enumerate(terminated):
             if term: agent_state[n] = agent.reset_rec_state()
         rewards[:, t] = torch.from_numpy(rwd)
@@ -95,14 +95,15 @@ def eval(agent, env, n_eval_episodes, device):
         agent_state = agent.reset_rec_state().unsqueeze(0).to(device)  # add batch dim
         obs, info = env.reset()
         terminated = False
-        ep_ret = 0
         while not terminated:
             actor_out, agent_state = agent.get_action(torch.from_numpy(obs).float().unsqueeze(0).to(device), agent_state)
             act, *_ = actor_out
             obs, rwd, done, truncated, info = env.step(act.item())
             terminated = done or truncated
-            ep_ret += rwd
-        scores[ep] = ep_ret
+        if hasattr(env, 'last_success'):
+            scores[ep] = int(env.last_success)
+        else:
+            scores[ep] = env.return_queue[ep]
     return scores
             
 
@@ -197,7 +198,7 @@ def train():
             for step in range(int(batch_size / minibatch)):
                 b_inds = inds[step*minibatch:(step+1)*minibatch]
                 b_obs = observations[b_inds]
-                b_act_prob = action_probs[b_inds].view(-1)
+                # b_act_prob = action_probs[b_inds].view(-1)
                 b_rwd_to_go = rewards_to_go[b_inds].view(-1)
                 # b_val = values[b_inds].view(-1)
                 b_adv = advantages[b_inds].view(-1)
@@ -232,8 +233,7 @@ def train():
         env_steps_trained = iter * batch_size
         
         if iter % log_every == 0:
-            # TODO: running average for all losses
-            episode_score_mean = sum(env.return_queue)/(max(len(env.return_queue), 1))
+            episode_ret_mean = sum(env.return_queue)/(max(len(env.return_queue), 1))
             episode_len_mean = sum(env.length_queue)/(max(len(env.length_queue), 1))
             loss_mean = sum(run_loss)/len(run_loss)
             actor_loss_mean = sum(run_actor_loss)/len(run_actor_loss)
@@ -241,7 +241,7 @@ def train():
             entropy_loss_mean = sum(run_entropy_loss)/len(run_entropy_loss)
             print(f"| iter: {iter} | env steps trained: {env_steps_trained} |")
             print(f"| loss: {loss_mean} | actor loss: {actor_loss_mean} | critic loss: {critic_loss_mean} | entropy loss: {entropy_loss_mean} |")
-            print(f"| train/episode_score_mean: {episode_score_mean} | train/episode_len_mean: {episode_len_mean} |")
+            print(f"| train/episode_ret_mean: {episode_ret_mean} | train/episode_len_mean: {episode_len_mean} |")
             print(f"| lr: {optimizer.param_groups[0]['lr']} | ppo_eps: {ppo_eps}")
             print("==================")
             wandb.log({
@@ -250,7 +250,7 @@ def train():
                 'train/critic_loss': critic_loss_mean,
                 'train/entropy_loss': entropy_loss_mean,
                 'train/episode_len_mean': episode_len_mean,
-                'train/episode_score_mean': episode_score_mean,
+                'train/episode_ret_mean': episode_ret_mean,
                 'train/lr': optimizer.param_groups[0]['lr'],
                 'train/clip_eps': ppo_eps, 
                 'env_steps_trained': env_steps_trained,
