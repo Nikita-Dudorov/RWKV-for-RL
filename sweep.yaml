@@ -1,0 +1,73 @@
+method: random
+metric:
+  goal: maximize
+  name: train/episode_ret_mean
+parameters:
+  device:
+    value: cuda
+  seed:
+    value: 123
+  project:
+    value: RWKV
+  tags:
+    value: [tmaze_ours]
+  env_id:
+    value: tmaze_ours
+  env_config:
+    parameters:
+      episode_length:
+        value: 250
+      corridor_length:
+        value: 40
+      goal_reward: 
+        value: 4
+      goal_penalty: 
+        value: 1
+      timestep_penalty:
+        value: 0.1
+      seed: 
+        value: null
+  n_env_steps:
+    value: 5000000
+  n_envs:
+    value: 8
+  rollout_len:
+    values: [128, 256]
+  minibatch:
+    values: [32, 64, 128]
+  n_epochs:
+    values: [5, 10]
+  lr:
+    values: [0.001, 0.0001, 0.00003]
+  lr_decay:
+    values: [false, true]
+  max_grad_norm:
+    values: [0.25, 0.5, 1.0]
+  log_every:
+    value: 10000
+  save_every:
+    value: null
+  save_path:
+    value: null
+  eval_every:
+    value: null
+  n_eval_episodes:
+    value: 100
+  videos:
+    value: false
+  d_model:
+    value: 64
+  d_ac:
+    values: [64, 128]
+  ppo_eps:
+    value: 0.2
+  ppo_eps_decay:
+    value: true
+  gamma:
+    value: 0.99
+  gae_lam:
+    value: 0.95
+  c_val_loss:
+    value: 0.5
+  c_entr_loss:
+    values: [0.03, 0.01, 0.001]

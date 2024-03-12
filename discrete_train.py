@@ -3,6 +3,7 @@ import random
 import torch
 import numpy as np
 import wandb
+import yaml
 import gymnasium as gym
 from collections import deque
 
@@ -107,8 +108,7 @@ def eval(agent, env, n_eval_episodes, device):
     return scores
             
 
-def train():
-    args = TmazeArgs()
+def train(args=None):
     ppo_eps = args.ppo_eps
     c_val_loss = args.c_val_loss
     c_entr_loss = args.c_entr_loss
@@ -119,7 +119,7 @@ def train():
     batch_size = n_envs * rollout_len
     n_iters = int(n_env_steps / batch_size)
     log_every = int(args.log_every / batch_size)
-    eval_every = int(args.eval_every / batch_size)
+    eval_every = None if args.eval_every is None else int(args.eval_every / batch_size)
     save_every = None if args.save_every is None else int(args.save_every / batch_size)
     device = args.device
 
@@ -216,10 +216,10 @@ def train():
 
                 actor_loss = -(b_pred_act_prob * b_adv).mean()
                 # actor_loss = -torch.min(b_prob_ratio * b_adv, b_prob_ratio.clamp(1-ppo_eps, 1+ppo_eps) * b_adv).mean()  # PPO loss
-                critic_loss = ((b_pred_val - b_rwd_to_go)**2).mean()
-                entropy_loss = -b_pred_act_entropy.mean()
+                critic_loss = c_val_loss * ((b_pred_val - b_rwd_to_go)**2).mean()
+                entropy_loss = -c_entr_loss * b_pred_act_entropy.mean()
 
-                loss = actor_loss + c_val_loss * critic_loss + c_entr_loss * entropy_loss
+                loss = actor_loss + critic_loss + entropy_loss
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
@@ -255,7 +255,7 @@ def train():
                 'train/clip_eps': ppo_eps, 
                 'env_steps_trained': env_steps_trained,
             })
-        if iter % eval_every == 0:
+        if (eval_every is not None) and (iter % eval_every == 0):
             episode_scores = eval(agent, eval_env, args.n_eval_episodes, device)
             episode_score_mean = episode_scores.mean().item()
             episode_score_std = episode_scores.std().item()
@@ -281,4 +281,21 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    args = TmazeArgs()
+    train(args)
+
+    # sweep mode
+    # config_path = './sweep.yaml'
+    # project = "RWKV"
+
+    # def sweeper(config=None):
+    #     with wandb.init(
+    #         config=config,
+    #     ):
+    #         config = wandb.config
+    #         train(config)
+            
+    # with open(config_path, 'r') as stream:
+    #     sweep_config = yaml.safe_load(stream)
+    # sweep_id = wandb.sweep(sweep_config, project=project)
+    # wandb.agent(sweep_id, sweeper, count=10)
