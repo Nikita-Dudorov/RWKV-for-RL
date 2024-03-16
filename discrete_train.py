@@ -31,7 +31,7 @@ def get_rollout(
     rewards_to_go = torch.zeros((num_envs, rollout_len)).to(device)
     values = torch.zeros((num_envs, rollout_len)).to(device)
     advantages = torch.zeros((num_envs, rollout_len)).to(device)
-    terminals = np.zeros((num_envs, rollout_len), dtype=np.int32)  # taking action at this step terminates the episode
+    terminals = torch.zeros((num_envs, rollout_len)).to(device)  # taking action at this step terminates the episode
     assert agent_state.shape[0] == num_envs, "agent should have a separate recurrent state for each env"
     rollout_agent_states = torch.zeros((num_envs, rollout_len, *tuple(agent_state.shape[1:]))).to(device)
 
@@ -53,11 +53,12 @@ def get_rollout(
         for n, term in enumerate(terminated):
             if term: agent_state[n] = agent.reset_rec_state()
         rewards[:, t] = torch.from_numpy(rwd)
-        terminals[:, t] = terminated
+        terminals[:, t] = torch.from_numpy(terminated).int()
     last_obs = obs
 
     # calculate rewards-to-go
-    rewards_to_go[:, -1] = values[:, -1]  # TODO: rewards_to_go[:, -1] = rewards[:, -1] + gamma * agent.get_value(s_{rollout_len+1})
+    # TODO: rewards_to_go[:, -1] = rewards[:, -1] + gamma * agent.get_value(s_{rollout_len+1})
+    rewards_to_go[:, -1] = terminals[:, -1] * rewards[:, -1] + (1 - terminals[:, -1]) * values[:, -1]
     for t in reversed(range(0, rollout_len-1)):
         rewards_to_go[:, t] = rewards[:, t] + gamma * rewards_to_go[:, t+1] * (1 - terminals[:, t])
     
@@ -65,10 +66,11 @@ def get_rollout(
     if gae_lam is None:
         advantages = rewards_to_go - values
     else:
-        advantages[:, -1] = rewards_to_go[:, -1] - values[:, -1]
+        # TODO: advantages[: -1] = rewards[:, -1] + gamma * agent.get_value(s_{rollout_len+1}) - values[:, -1]
+        advantages[:, -1] = rewards[:, -1] - values[:, -1]
         for t in reversed(range(0, rollout_len-1)):
-            delta = rewards[:, t] + gamma * values[:, t+1] - values[:, t]
-            advantages[:, t] = delta + gamma * gae_lam * advantages[:, t+1]
+            delta = rewards[:, t] + gamma * values[:, t+1] * (1 - terminals[:, t]) - values[:, t]
+            advantages[:, t] = delta + gamma * gae_lam * advantages[:, t+1] * (1 - terminals[:, t])
 
     rollout = {
         'observations': observations,
@@ -179,7 +181,7 @@ def train(args=None):
         observations = rollout['observations'].view(-1, *obs_shape)
         action_probs = rollout['action_probs'].view(-1, 1)
         rewards_to_go = rollout['rewards_to_go'].view(-1, 1) 
-        values = rollout['valaues'].view(-1, 1)
+        values = rollout['values'].view(-1, 1)
         advantages = rollout['advantages'].view(-1, 1)
         rollout_agent_states = rollout['rollout_agent_states'].view(-1, *agent_state_shape)
         assert len(observations) == batch_size
