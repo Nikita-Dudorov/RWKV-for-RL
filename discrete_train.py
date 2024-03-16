@@ -19,8 +19,9 @@ def get_rollout(
         env, 
         init_obs, 
         rollout_len, 
-        gamma, 
-        device,
+        gamma,
+        gae_lam=None,
+        device='cpu',
     ):
     num_envs = env.observation_space.shape[0]
     obs_shape = env.observation_space.shape[1:]
@@ -54,29 +55,20 @@ def get_rollout(
         rewards[:, t] = torch.from_numpy(rwd)
         terminals[:, t] = terminated
     last_obs = obs
-    last_val = val
 
     # calculate rewards-to-go
-    for n in range(num_envs):
-        episode_intervals = [-1] + list(np.where(terminals[n] == 1)[0])
-        if episode_intervals[-1] != rollout_len-1: episode_intervals = episode_intervals + [rollout_len-1]
-        episode_intervals = [(start+1, stop) for start, stop in zip(episode_intervals[:-1], episode_intervals[1:])]
-        for interval in episode_intervals:
-            start, stop = interval
-            for t in reversed(range(start, stop+1)):
-                if terminals[n, t]: 
-                    rewards_to_go[n, t] = rewards[n, t]
-                else:
-                    if t <= rollout_len - 2:
-                        rewards_to_go[n, t] = rewards[n, t] + gamma * rewards_to_go[n, t+1]
-                    else:
-                        rewards_to_go[n, t] = last_val[n]
-    # rewards_to_go = (rewards_to_go - rewards_to_go.mean()) / (rewards_to_go.std() + 1e-8)  # TODO normalize rewards-to-go?
+    rewards_to_go[:, -1] = values[:, -1]  # TODO: rewards_to_go[:, -1] = rewards[:, -1] + gamma * agent.get_value(s_{rollout_len+1})
+    for t in reversed(range(0, rollout_len-1)):
+        rewards_to_go[:, t] = rewards[:, t] + gamma * rewards_to_go[:, t+1] * (1 - terminals[:, t])
     
     # calculate advantages
-    advantages = rewards_to_go - values
-    # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # TODO normalize advantages?
-    # TODO gae + lambda
+    if gae_lam is None:
+        advantages = rewards_to_go - values
+    else:
+        advantages[:, -1] = rewards_to_go[:, -1] - values[:, -1]
+        for t in reversed(range(0, rollout_len-1)):
+            delta = rewards[:, t] + gamma * values[:, t+1] - values[:, t]
+            advantages[:, t] = delta + gamma * gae_lam * advantages[:, t+1]
 
     rollout = {
         'observations': observations,
@@ -109,7 +101,7 @@ def eval(agent, env, n_eval_episodes, device):
             
 
 def train(args=None):
-    ppo_eps = args.ppo_eps
+    clip_eps = args.clip_eps
     c_val_loss = args.c_val_loss
     c_entr_loss = args.c_entr_loss
     n_env_steps = args.n_env_steps
@@ -183,14 +175,18 @@ def train(args=None):
     run_entropy_loss = deque(maxlen=run_window)
     for iter in range(1, n_iters+1):
 
-        rollout, init_obs, agent_states = get_rollout(agent, agent_states, env, init_obs, rollout_len, args.gamma, device)
+        rollout, init_obs, agent_states = get_rollout(agent, agent_states, env, init_obs, rollout_len, args.gamma, args.gae_lam, device)
         observations = rollout['observations'].view(-1, *obs_shape)
         action_probs = rollout['action_probs'].view(-1, 1)
         rewards_to_go = rollout['rewards_to_go'].view(-1, 1) 
-        # values = rollout['valaues'].view(-1, 1)
+        values = rollout['valaues'].view(-1, 1)
         advantages = rollout['advantages'].view(-1, 1)
         rollout_agent_states = rollout['rollout_agent_states'].view(-1, *agent_state_shape)
         assert len(observations) == batch_size
+
+        # rewards_to_go = (rewards_to_go - rewards_to_go.mean()) / (rewards_to_go.std() + 1e-8)  # TODO normalize rewards-to-go?
+        if args.norm_adv:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         for epoch in range(args.n_epochs):
             inds = torch.arange(0, batch_size)
@@ -198,26 +194,25 @@ def train(args=None):
             for step in range(int(batch_size / minibatch)):
                 b_inds = inds[step*minibatch:(step+1)*minibatch]
                 b_obs = observations[b_inds]
-                # b_act_prob = action_probs[b_inds].view(-1)
+                b_act_prob = action_probs[b_inds].view(-1)
                 b_rwd_to_go = rewards_to_go[b_inds].view(-1)
-                # b_val = values[b_inds].view(-1)
+                b_val = values[b_inds].view(-1)
                 b_adv = advantages[b_inds].view(-1)
                 b_rollout_agent_st = rollout_agent_states[b_inds]
                 
-                # TODO: normalize batch?
-                # b_rwd_to_go = (b_rwd_to_go - b_rwd_to_go.mean()) / (b_rwd_to_go.std() + 1e-8)
-                # b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
+                actor_out, critic_out, pred_agent_st = agent.get_action_and_value(b_obs, b_rollout_agent_st)
+                pred_act, pred_act_prob, pred_act_entropy = actor_out
+                r = pred_act_prob / b_act_prob
+                pred_val = critic_out.view(-1)
+                if args.clip_values:
+                    pred_val = b_val + (pred_val - b_val).clip(-clip_eps, clip_eps)
 
-                actor_out, critic_out, b_pred_agent_st = agent.get_action_and_value(b_obs, b_rollout_agent_st)
-                b_pred_act, b_pred_act_prob, b_pred_act_entropy = actor_out
-                # b_prob_ratio = b_pred_act_prob / b_act_prob
-                b_pred_val = critic_out.view(-1)
-                # b_pred_val = b_val + (b_pred_val - b_val).clip(-ppo_eps, ppo_eps)  # TODO: clip values?
-
-                actor_loss = -(b_pred_act_prob * b_adv).mean()
-                # actor_loss = -torch.min(b_prob_ratio * b_adv, b_prob_ratio.clamp(1-ppo_eps, 1+ppo_eps) * b_adv).mean()  # PPO loss
-                critic_loss = c_val_loss * ((b_pred_val - b_rwd_to_go)**2).mean()
-                entropy_loss = -c_entr_loss * b_pred_act_entropy.mean()
+                if args.ppo:
+                    actor_loss = -torch.min(r * b_adv, r.clip(1-ppo_eps, 1+ppo_eps) * b_adv).mean()
+                else:
+                    actor_loss = -(torch.log(pred_act_prob) * b_adv).mean()
+                critic_loss = c_val_loss * ((pred_val - b_rwd_to_go)**2).mean()
+                entropy_loss = -c_entr_loss * pred_act_entropy.mean()
 
                 loss = actor_loss + critic_loss + entropy_loss
                 optimizer.zero_grad()
@@ -242,7 +237,7 @@ def train(args=None):
             print(f"| iter: {iter} | env steps trained: {env_steps_trained} |")
             print(f"| loss: {loss_mean} | actor loss: {actor_loss_mean} | critic loss: {critic_loss_mean} | entropy loss: {entropy_loss_mean} |")
             print(f"| train/episode_ret_mean: {episode_ret_mean} | train/episode_len_mean: {episode_len_mean} |")
-            print(f"| lr: {optimizer.param_groups[0]['lr']} | ppo_eps: {ppo_eps}")
+            print(f"| lr: {optimizer.param_groups[0]['lr']} | clip_eps: {clip_eps}")
             print("==================")
             wandb.log({
                 'train/loss': loss_mean, 
@@ -252,7 +247,7 @@ def train(args=None):
                 'train/episode_len_mean': episode_len_mean,
                 'train/episode_ret_mean': episode_ret_mean,
                 'train/lr': optimizer.param_groups[0]['lr'],
-                'train/clip_eps': ppo_eps, 
+                'train/clip_eps': clip_eps, 
                 'env_steps_trained': env_steps_trained,
             })
         if (eval_every is not None) and (iter % eval_every == 0):
@@ -271,10 +266,15 @@ def train(args=None):
         if (save_every is not None) and (iter % save_every == 0):
             torch.save(agent.state_dict(), os.path.join(args.save_path, str(iter)))
 
-        if args.lr_decay:
-            optimizer.param_groups[0]['lr'] = args.lr * (1 - iter / n_iters)
-        if args.ppo_eps_decay:
-            ppo_eps = args.ppo_eps * (1 - iter / n_iters)
+        if args.lr_decay is not None:
+            if args.lr_decay == 'linear':
+                optimizer.param_groups[0]['lr'] = args.lr * (1 - 0.9*(iter/n_iters))
+            elif args.lr_decay == 'exp':
+                optimizer.param_groups[0]['lr'] = args.lr * 0.1**(iter/n_iters)
+            else:
+                raise ValueError(f"unknown decay type: {args.lr_decay}") 
+        if args.clip_eps_decay:
+            clip_eps = args.clip_eps * (1 - 0.9*(iter/n_iters))
 
     env.close()
     eval_env.close()
