@@ -17,6 +17,7 @@ class TmazeArgs:
             'timestep_penalty': 0.1,
             'seed': None,
         }
+        self.discrete_actions = True
 
         # train
         self.n_env_steps = 10000000
@@ -25,7 +26,7 @@ class TmazeArgs:
         self.minibatch = 64
         self.n_epochs = 5
         self.lr = 0.0001
-        self.lr_decay = 'linear'
+        self.lr_decay = 'exp'
         self.max_grad_norm = 0.5
 
         # log
@@ -40,13 +41,14 @@ class TmazeArgs:
 
         # agent
         self.ppo = False
+        self.n_layers = 3
         self.d_model = 64
         self.d_ac = 128
         self.clip_eps = None
         self.clip_eps_decay = False
         self.clip_values = False
-        self.norm_adv = False
+        self.norm_adv = True
         self.gamma = 0.99
-        self.gae_lam = None
+        self.gae_lam = 0.95
         self.c_val_loss = 0.5
         self.c_entr_loss = 0.01

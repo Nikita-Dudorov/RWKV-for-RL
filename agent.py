@@ -1,25 +1,34 @@
 from torch import nn
-from actor_critic import DiscreteActorCritic
+from actor_critic import DiscreteActorCritic, ContinuousActorCritic
 from rwkv import Rwkv
 
 class RwkvAgent(nn.Module):  
     def __init__(
             self,
-            n_layers,
-            d_model,
-            d_ac,
-            obs_shape,
-            act_dim,
+            n_layers: int,
+            d_model: int,
+            d_ac: int,
+            obs_shape: tuple[int],
+            act_dim: int,
+            discrete_actions: bool
         ):
         super().__init__()
         assert len(obs_shape) == 1  # currently supports only row observation
         self.encoder = nn.Linear(obs_shape[0], d_model) 
         self.seq_model = Rwkv(n_layers, d_model)
-        self.ac = DiscreteActorCritic(
-            n_hidden=d_ac, 
-            obs_dim=d_model,
-            act_dim=act_dim, 
-        )
+        if discrete_actions:
+            self.ac = DiscreteActorCritic(
+                n_hidden=d_ac, 
+                obs_dim=d_model,
+                act_dim=act_dim, 
+            )
+        else:
+            self.ac = ContinuousActorCritic(
+                n_hidden=d_ac, 
+                obs_dim=d_model,
+                act_dim=act_dim, 
+            )
+
 
     def reset_rec_state(self):
         rec_state = self.seq_model.get_initial_state()

@@ -160,6 +160,7 @@ def train(args=None):
         d_ac=args.d_ac,
         obs_shape=obs_shape,
         act_dim=act_dim,
+        discrete_actions=args.discrete_actions
     ).to(device)
     # agent should have a separate recurrent state for each env and reset it as env resets
     agent_states = torch.stack([agent.reset_rec_state() for n in range(n_envs)]).to(device)
