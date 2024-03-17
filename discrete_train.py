@@ -23,8 +23,8 @@ def get_rollout(
         gae_lam=None,
         device='cpu',
     ):
-    num_envs = env.observation_space.shape[0]
-    obs_shape = env.observation_space.shape[1:]
+    num_envs = env.num_envs
+    obs_shape = env.single_observation_space.shape
     observations = torch.zeros((num_envs, rollout_len, *obs_shape)).to(device)
     action_probs = torch.zeros((num_envs, rollout_len)).to(device)
     rewards = torch.zeros((num_envs, rollout_len)).to(device)
@@ -154,8 +154,8 @@ def train(args=None):
     init_obs, info = env.reset(seed=[random.randint(1, 999) for n in range(n_envs)])
 
     # define agent
-    obs_shape = env.observation_space.shape[1:]
-    act_dim = env.action_space[0].n
+    obs_shape = env.single_observation_space.shape
+    act_dim = env.single_action_space.n
     agent = RwkvAgent(
         d_model=args.d_model,
         d_ac=args.d_ac,
@@ -186,10 +186,6 @@ def train(args=None):
         rollout_agent_states = rollout['rollout_agent_states'].view(-1, *agent_state_shape)
         assert len(observations) == batch_size
 
-        # rewards_to_go = (rewards_to_go - rewards_to_go.mean()) / (rewards_to_go.std() + 1e-8)  # TODO normalize rewards-to-go?
-        if args.norm_adv:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
         for epoch in range(args.n_epochs):
             inds = torch.arange(0, batch_size)
             inds = inds[torch.randperm(len(inds))]
@@ -201,7 +197,9 @@ def train(args=None):
                 b_val = values[b_inds].view(-1)
                 b_adv = advantages[b_inds].view(-1)
                 b_rollout_agent_st = rollout_agent_states[b_inds]
-                
+                if args.norm_adv:
+                    b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
+
                 actor_out, critic_out, pred_agent_st = agent.get_action_and_value(b_obs, b_rollout_agent_st)
                 pred_act, pred_act_prob, pred_act_entropy = actor_out
                 r = pred_act_prob / b_act_prob
@@ -210,7 +208,7 @@ def train(args=None):
                     pred_val = b_val + (pred_val - b_val).clip(-clip_eps, clip_eps)
 
                 if args.ppo:
-                    actor_loss = -torch.min(r * b_adv, r.clip(1-ppo_eps, 1+ppo_eps) * b_adv).mean()
+                    actor_loss = -torch.min(r * b_adv, r.clip(1-clip_eps, 1+clip_eps) * b_adv).mean()
                 else:
                     actor_loss = -(torch.log(pred_act_prob) * b_adv).mean()
                 critic_loss = c_val_loss * ((pred_val - b_rwd_to_go)**2).mean()
