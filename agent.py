@@ -1,46 +1,47 @@
 from torch import nn
 from actor_critic import DiscreteActorCritic
-from rwkv import RwkvCell
+from rwkv import Rwkv
 
 class RwkvAgent(nn.Module):  
     def __init__(
             self,
+            n_layers,
             d_model,
             d_ac,
-            obs_dim,
+            obs_shape,
             act_dim,
         ):
         super().__init__()
-        self.encoder = nn.Linear(obs_dim, d_model)  # supports only row observation
-        self.seq_model = RwkvCell(d_model)
+        assert len(obs_shape) == 1  # currently supports only row observation
+        self.encoder = nn.Linear(obs_shape[0], d_model) 
+        self.seq_model = Rwkv(n_layers, d_model)
         self.ac = DiscreteActorCritic(
             n_hidden=d_ac, 
             obs_dim=d_model,
             act_dim=act_dim, 
         )
-        # TODO: init weights
 
     def reset_rec_state(self):
-        new_rec_state = self.seq_model.get_initial_state()
-        return new_rec_state
+        rec_state = self.seq_model.get_initial_state()
+        return rec_state
 
     def get_hidden(self, obs, rec_state):
         x = self.encoder(obs)
-        x, new_rec_state = self.seq_model(x, rec_state)
-        return x, new_rec_state
+        x, rec_state = self.seq_model(x, rec_state)
+        return x, rec_state
 
     def get_action_and_value(self, obs, rec_state):
-        x, new_rec_state = self.get_hidden(obs, rec_state)
+        x, rec_state = self.get_hidden(obs, rec_state)
         actor_out = self.ac.get_action(x)
         critic_out = self.ac.get_value(x)
-        return actor_out, critic_out, new_rec_state
+        return actor_out, critic_out, rec_state
 
     def get_action(self, obs, rec_state):
-        x, new_rec_state = self.get_hidden(obs, rec_state)
+        x, rec_state = self.get_hidden(obs, rec_state)
         actor_out = self.ac.get_action(x)
-        return actor_out, new_rec_state
+        return actor_out, rec_state
 
     def get_value(self, obs, rec_state):
-        x, new_rec_state = self.get_hidden(obs, rec_state)
+        x, rec_state = self.get_hidden(obs, rec_state)
         critic_out = self.ac.get_value(x)
-        return critic_out, new_rec_state
+        return critic_out, rec_state

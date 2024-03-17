@@ -124,9 +124,7 @@ def train(args=None):
         config=args,
         monitor_gym=True,
     )
-    # define our custom x axis metric
     wandb.define_metric("env_steps_trained")
-    # define which metrics will be plotted against it
     wandb.define_metric("train/*", step_metric="env_steps_trained")
     wandb.define_metric("eval/*", step_metric="env_steps_trained")
 
@@ -157,9 +155,10 @@ def train(args=None):
     obs_shape = env.single_observation_space.shape
     act_dim = env.single_action_space.n
     agent = RwkvAgent(
+        n_layers=args.n_layers,
         d_model=args.d_model,
         d_ac=args.d_ac,
-        obs_dim=obs_shape[0],  # supports only row observation
+        obs_shape=obs_shape,
         act_dim=act_dim,
     ).to(device)
     # agent should have a separate recurrent state for each env and reset it as env resets
