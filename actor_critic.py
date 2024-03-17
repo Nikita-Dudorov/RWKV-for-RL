@@ -45,7 +45,7 @@ class ContinuousActorCritic(nn.Module):
         dist = Normal(act_mean, act_std)
         act = dist.sample()
         # return action, action probability, entropy of action distribution
-        return act, dist.log_prob(act).sum(1).exp(), dist.entropy().sum(1)  # suppose independetnt components -> summation over action dim 
+        return act, dist.log_prob(act).sum(axis=-1).exp(), dist.entropy().sum(axis=-1)  # suppose independetnt components -> summation over action dim 
 
 class DiscreteActorCritic(nn.Module):
     """Implements actor-critic agent for row observation and discrete action space"""
@@ -81,8 +81,10 @@ class DiscreteActorCritic(nn.Module):
     def get_value(self, obs):
         return self._critic(obs)
 
-    def get_action(self, obs):
+    def get_action(self, obs, return_logits=False):
         logits = self._actor(obs)
+        if return_logits:
+            return logits
         dist = Categorical(logits=logits)
         act = dist.sample()
         # return action, action probability, entropy of action distribution

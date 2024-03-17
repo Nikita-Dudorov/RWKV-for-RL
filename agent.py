@@ -45,9 +45,9 @@ class RwkvAgent(nn.Module):
         critic_out = self.ac.get_value(x)
         return actor_out, critic_out, rec_state
 
-    def get_action(self, obs, rec_state):
+    def get_action(self, obs, rec_state, **kwargs):
         x, rec_state = self.get_hidden(obs, rec_state)
-        actor_out = self.ac.get_action(x)
+        actor_out = self.ac.get_action(x, **kwargs)
         return actor_out, rec_state
 
     def get_value(self, obs, rec_state):
