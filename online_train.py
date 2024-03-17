@@ -86,6 +86,7 @@ def get_rollout(
 @torch.no_grad()
 def eval(agent, env, n_eval_episodes, device):
     scores = torch.zeros(n_eval_episodes)
+    lengths = torch.zeros(n_eval_episodes)
     for ep in range(n_eval_episodes):
         agent_state = agent.reset_rec_state().unsqueeze(0).to(device)  # add batch dim
         obs, info = env.reset()
@@ -99,7 +100,8 @@ def eval(agent, env, n_eval_episodes, device):
             scores[ep] = int(env.last_success)
         else:
             scores[ep] = env.return_queue[ep]
-    return scores
+        lengths[ep] = env.length_queue[ep]
+    return {'scores': scores, 'lengths': lengths}
             
 
 def train(args=None):
@@ -237,7 +239,7 @@ def train(args=None):
             print(f"| iter: {iter} | env steps trained: {env_steps_trained} |")
             print(f"| loss: {loss_mean} | actor loss: {actor_loss_mean} | critic loss: {critic_loss_mean} | entropy loss: {entropy_loss_mean} |")
             print(f"| train/episode_ret_mean: {episode_ret_mean} | train/episode_len_mean: {episode_len_mean} |")
-            print(f"| lr: {optimizer.param_groups[0]['lr']} | clip_eps: {clip_eps}")
+            print(f"| lr: {optimizer.param_groups[0]['lr']} | clip_eps: {clip_eps} |")
             print("==================")
             wandb.log({
                 'train/loss': loss_mean, 
@@ -251,9 +253,12 @@ def train(args=None):
                 'env_steps_trained': env_steps_trained,
             })
         if (eval_every is not None) and (iter % eval_every == 0):
-            episode_scores = eval(agent, eval_env, args.n_eval_episodes, device)
+            eval_out = eval(agent, eval_env, args.n_eval_episodes, device)
+            episode_scores = eval_out['scores']
+            episode_lengths = eval_out['lengths']
             episode_score_mean = episode_scores.mean().item()
             episode_score_std = episode_scores.std().item()
+            episode_len_mean = episode_lengths.mean().item()
             print(f"| iter: {iter} | env steps trained: {env_steps_trained} |")
             print(f"| eval/episode_score_mean: {episode_score_mean} | eval/episode_score_std: {episode_score_std} |")
             print("==================")
