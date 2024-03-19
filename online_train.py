@@ -8,7 +8,7 @@ import gymnasium as gym
 from collections import deque
 
 from create_env import create_env
-from config import TmazeArgs
+from config import TmazeArgs, CartpoleArgs
 from agent import RwkvAgent
 
 
@@ -85,8 +85,8 @@ def get_rollout(
 
 @torch.no_grad()
 def eval(agent, env, n_eval_episodes, device):
-    scores = torch.zeros(n_eval_episodes)
-    lengths = torch.zeros(n_eval_episodes)
+    scores = np.zeros(n_eval_episodes)
+    lengths = np.zeros(n_eval_episodes)
     for ep in range(n_eval_episodes):
         agent_state = agent.reset_rec_state().unsqueeze(0).to(device)  # add batch dim
         obs, info = env.reset()
@@ -99,8 +99,8 @@ def eval(agent, env, n_eval_episodes, device):
         if hasattr(env, 'last_success'):
             scores[ep] = int(env.last_success)
         else:
-            scores[ep] = env.return_queue[ep]
-        lengths[ep] = env.length_queue[ep]
+            scores[ep] = env.return_queue[-1].item()
+        lengths[ep] = env.length_queue[-1].item()
     return {'scores': scores, 'lengths': lengths}
             
 
@@ -286,7 +286,7 @@ def train(args=None):
 
 
 if __name__ == "__main__":
-    args = TmazeArgs()
+    args = CartpoleArgs()
     train(args)
 
     # sweep mode
