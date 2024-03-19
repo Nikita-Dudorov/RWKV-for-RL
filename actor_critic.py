@@ -3,6 +3,15 @@ from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 from torch import nn
 
+
+# TODO which layer init to use?
+def init_weights(layer, std=1.0, bias=0.0):
+    if type(layer) == nn.Linear:
+        nn.init.orthogonal_(layer.weight, std)
+        # nn.init.xavier_normal_(layer.weight)
+        nn.init.constant_(layer.bias, bias)
+
+
 class ContinuousActorCritic(nn.Module):
     """Implements actor-critic agent for row observation and continuous action space"""
 
@@ -26,13 +35,6 @@ class ContinuousActorCritic(nn.Module):
         )
 
         self._actor_std = nn.Parameter(torch.zeros(1, act_dim))
-
-        # TODO which layer init to use?
-        def init_weights(layer, std=1.0, bias=0.0):
-            if type(layer) == nn.Linear:
-                nn.init.orthogonal_(layer.weight, std)
-                # nn.init.xavier_normal_(layer.weight)
-                nn.init.constant_(layer.bias, bias)
         
         self.apply(init_weights)
 
@@ -47,6 +49,7 @@ class ContinuousActorCritic(nn.Module):
         # return action, action probability, entropy of action distribution
         return act, dist.log_prob(act).sum(axis=-1).exp(), dist.entropy().sum(axis=-1)  # suppose independetnt components -> summation over action dim 
 
+
 class DiscreteActorCritic(nn.Module):
     """Implements actor-critic agent for row observation and discrete action space"""
 
@@ -55,26 +58,19 @@ class DiscreteActorCritic(nn.Module):
 
         self._critic = nn.Sequential(
             nn.Linear(obs_dim, n_hidden, bias=True),
-            nn.Tanh(),
-            nn.Linear(n_hidden, n_hidden, bias=True),
-            nn.Tanh(),
+            nn.ReLU(),
+            # nn.Linear(n_hidden, n_hidden, bias=True),
+            # nn.Tanh(),
             nn.Linear(n_hidden, 1, bias=True)
         )
         
         self._actor = nn.Sequential(
             nn.Linear(obs_dim, n_hidden, bias=True),
-            nn.Tanh(),
-            nn.Linear(n_hidden, n_hidden, bias=True),
-            nn.Tanh(),
+            nn.ReLU(),
+            # nn.Linear(n_hidden, n_hidden, bias=True),
+            # nn.Tanh(),
             nn.Linear(n_hidden, act_dim, bias=True)
         )
-
-        # TODO which layer init to use?
-        def init_weights(layer, std=1.0, bias=0.0):
-            if type(layer) == nn.Linear:
-                nn.init.orthogonal_(layer.weight, std)
-                # nn.init.xavier_normal_(layer.weight)
-                nn.init.constant_(layer.bias, bias)
         
         self.apply(init_weights)
 
