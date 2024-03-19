@@ -99,8 +99,10 @@ class RwkvTimeMix(nn.Module):
     # @torch.jit.script_method
     def forward(self, x, state):
         # print(f'{x.shape=}')
-
-        alpha, aa, bb, pp = state
+        alpha = state[:, 0]
+        aa = state[:, 1]
+        bb = state[:, 2]
+        pp = state[:, 3]
 
         xk = x * self.time_mix_k + alpha * (1 - self.time_mix_k)
         xv = x * self.time_mix_v + alpha * (1 - self.time_mix_v)
@@ -166,6 +168,8 @@ class RwkvCell(nn.Module):
         self.cm_layer_norm = nn.LayerNorm(self.hidden_size)
         self.chan_mix = RwkvChannelMix(hidden_size, dim_ffn=hidden_size)
 
+        # TODO: init weights
+
     def get_initial_state(self):
         state = torch.zeros(5, self.hidden_size)
         # set `pp` param to -inf, as it defines the minimum threshold in max(pp, ww) oper
@@ -173,14 +177,17 @@ class RwkvCell(nn.Module):
         return state
 
     def forward(self, x, state):
+        # batch over x and state
+        assert x.shape[0] == state.shape[0]
         # print(f'Input:', x)
         # print(f'State:', state)
 
         # extract state: (output_state, hidden_state)
-        _, state = state
+        # TODO: what's this
+        # _, state = state
 
         # NB: state: channel state (top) then time state (bottom)
-        chan_state, time_state = state[0], state[1:]
+        chan_state, time_state = state[:, 0], state[:, 1:]
 
         time_x, next_time_state = self.time_mix(self.tm_layer_norm(x), time_state)
         # residual connection + dropout
@@ -199,4 +206,28 @@ class RwkvCell(nn.Module):
         # print(f'OutState:', state)
         # print('====================================================')
         # print()
+        # TODO: why state shape isn't preserved through forward pass 
+        state = state.permute(1,0,2)
         return x, state
+    
+
+class Rwkv(nn.Module):
+    def __init__(self, n_layers, hidden_size):
+        super().__init__()
+        self.seq_model = nn.Sequential()
+        layers = [(f"layer{n}", RwkvCell(hidden_size)) for n in range(n_layers)]
+        [self.seq_model.add_module(n, l) for n, l in layers]    
+    
+    def get_initial_state(self):
+        state = torch.stack([layer.get_initial_state() for layer in self.seq_model])
+        return state
+
+    def forward(self, x, state):
+        # TODO: speed up with parallel compute
+        # batch over x and state
+        assert x.shape[0] == state.shape[0]
+
+        new_state = torch.zeros_like(state)
+        for n, layer in enumerate(self.seq_model):
+            x, new_state[:, n] = layer(x, state[:, n])
+        return x, new_state
