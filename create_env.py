@@ -1,8 +1,8 @@
 import gymnasium as gym
+from envs.tmaze_ours import TMazeOurs
 
 def create_env(env_id, **kwargs):
     if env_id == "tmaze_ours":
-        from envs.tmaze_ours import TMazeOurs
         env = TMazeOurs(
             episode_length=kwargs["episode_length"],
             corridor_length=kwargs["corridor_length"],
@@ -13,4 +13,5 @@ def create_env(env_id, **kwargs):
         )
         return env
     else:
-        raise NotImplementedError(f"Unknow environement '{env_id}'") 
+        env = gym.make(env_id, **kwargs)
+        return env
