@@ -202,12 +202,10 @@ class RwkvCell(nn.Module):
         # print(f'TCha:', x)
 
         # NB: state: channel state (top) then time state (bottom)
-        state = torch.stack((next_chan_state, ) + next_time_state)
+        state = torch.stack((next_chan_state, ) + next_time_state, axis=1)
         # print(f'OutState:', state)
         # print('====================================================')
         # print()
-        # TODO: why state shape isn't preserved through forward pass 
-        state = state.permute(1,0,2)
         return x, state
     
 
