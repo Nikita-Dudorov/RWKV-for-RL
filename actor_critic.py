@@ -4,11 +4,12 @@ from torch.distributions.normal import Normal
 from torch import nn
 
 
-# TODO which layer init to use?
-def init_weights(layer, std=1.0, bias=0.0):
+def init_weights(layer, scale=1.0, bias=0.0, method='ort'):
     if type(layer) == nn.Linear:
-        nn.init.orthogonal_(layer.weight, std)
-        # nn.init.xavier_normal_(layer.weight)
+        if method == 'ort':
+            nn.init.orthogonal_(layer.weight, scale)
+        elif method == 'xavier':
+            nn.init.xavier_normal_(layer.weight, scale)
         nn.init.constant_(layer.bias, bias)
 
 
@@ -58,7 +59,7 @@ class DiscreteActorCritic(nn.Module):
 
         self._critic = nn.Sequential(
             nn.Linear(obs_dim, n_hidden, bias=True),
-            nn.ReLU(),
+            nn.Tanh(),
             # nn.Linear(n_hidden, n_hidden, bias=True),
             # nn.Tanh(),
             nn.Linear(n_hidden, 1, bias=True)
@@ -66,7 +67,7 @@ class DiscreteActorCritic(nn.Module):
         
         self._actor = nn.Sequential(
             nn.Linear(obs_dim, n_hidden, bias=True),
-            nn.ReLU(),
+            nn.Tanh(),
             # nn.Linear(n_hidden, n_hidden, bias=True),
             # nn.Tanh(),
             nn.Linear(n_hidden, act_dim, bias=True)
